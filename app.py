@@ -1,6 +1,9 @@
 # =========================
 # 1. CRITICAL THREAD & RESOURCE LOCKS
 # =========================
+import warnings
+warnings.filterwarnings('ignore', category=FutureWarning)
+
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -33,7 +36,7 @@ ticker = st.text_input("Ticker Symbol (e.g., AAPL, TSLA)", "AAPL").upper()
 # =========================
 # 3. INTERACTIVE TRIGGER (Prevents Boot-Up Crashes)
 # =========================
-if st.button("🚀 Run AI Analysis"):
+if st.button("🚀 Run Local AI Analysis"):
     
     # --- FETCH DATA ---
     with st.spinner("Fetching market data..."):
@@ -57,9 +60,12 @@ if st.button("🚀 Run AI Analysis"):
     data = []
     week_ago = datetime.now().date() - timedelta(days=7)
     
-    with st.spinner("Loading AI Model (this takes a moment)..."):
-        # Load model WITHOUT caching so we can destroy it later
-        sentiment_model = pipeline("sentiment-analysis", model="ProsusAI/finbert")
+    with st.spinner("Loading Distilled AI Model (Local)..."):
+        # ✅ Using a smaller, distilled financial model to save RAM
+        sentiment_model = pipeline(
+            "sentiment-analysis", 
+            model="mrm8488/distilroberta-finetuned-financial-news-sentiment-analysis"
+        )
         
         with st.spinner("Analyzing Sentiments..."):
             for entry in news:
@@ -67,7 +73,9 @@ if st.button("🚀 Run AI Analysis"):
                 dt = datetime(*entry.published_parsed[:6]).date()
                 if dt < week_ago: continue
                     
-                label = sentiment_model(entry.title)[0]['label']
+                result = sentiment_model(entry.title)[0]
+                label = result['label'].lower()
+                
                 score = 1 if label == "positive" else -1 if label == "negative" else 0
                 
                 data.append({
@@ -120,6 +128,22 @@ if st.button("🚀 Run AI Analysis"):
         height=400, margin=dict(l=0, r=0, t=40, b=0)
     )
     st.plotly_chart(fig, use_container_width=True)
+    
+    # Market Summary
+    st.markdown("### 🧠 AI Market Summary")
+    trend = "positive" if df_daily.iloc[-1] > 0 else "negative" if df_daily.iloc[-1] < 0 else "neutral"
+    
+    pos_headlines = df[df['label'] == 'positive']['title'].tolist()
+    neg_headlines = df[df['label'] == 'negative']['title'].tolist()
+
+    if trend == "positive" and pos_headlines:
+        summary = f"Market sentiment is structurally positive. Key catalyst: '{pos_headlines[0]}'"
+    elif trend == "negative" and neg_headlines:
+        summary = f"Market sentiment leans negative, driven primarily by risks such as: '{neg_headlines[0]}'"
+    else:
+        summary = f"Market sentiment is highly mixed and currently tracking {trend}."
+        
+    st.success(summary)
 
     # News Feed
     st.markdown("### 📰 Recent Headlines")
