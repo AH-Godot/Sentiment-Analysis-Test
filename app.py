@@ -2,7 +2,7 @@ import streamlit as st
 import feedparser
 import pandas as pd
 import yfinance as yf
-from transformers import pipeline
+from transformers import pipeline, AutoTokenizer, AutoModelForSeq2SeqLM
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -18,12 +18,20 @@ st.title("📈 AI Stock Sentiment Dashboard")
 ticker = st.text_input("Ticker", "AAPL").upper()
 
 # =========================
-# ✅ 两个 pipeline
+# ✅ 模型加载（带容错）
 # =========================
 @st.cache_resource
 def load_models():
     sentiment_model = pipeline("sentiment-analysis", model="ProsusAI/finbert")
-    summarizer = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
+
+    summarizer = None
+    try:
+        tokenizer = AutoTokenizer.from_pretrained("sshleifer/distilbart-cnn-12-6")
+        model = AutoModelForSeq2SeqLM.from_pretrained("sshleifer/distilbart-cnn-12-6")
+        summarizer = pipeline("summarization", model=model, tokenizer=tokenizer)
+    except:
+        st.warning("⚠️ Summarization model unavailable. Using fallback.")
+
     return sentiment_model, summarizer
 
 sentiment_model, summarizer = load_models()
@@ -49,7 +57,6 @@ price = get_price(ticker)
 week_ago = datetime.now().date() - timedelta(days=7)
 
 data = []
-
 for entry in news[:50]:
     if not hasattr(entry, "published_parsed"):
         continue
@@ -77,7 +84,7 @@ for entry in news[:50]:
 df = pd.DataFrame(data)
 
 if df.empty:
-    st.warning("No data")
+    st.warning("No data available")
     st.stop()
 
 # =========================
@@ -89,7 +96,7 @@ price["date"] = price.index.date
 price_daily = price.groupby("date")["Close"].mean()
 
 # =========================
-# ✅ Trading Signal
+# Trading Signal
 # =========================
 def generate_signal(df_daily, price_daily):
     merged = pd.merge(price_daily, df_daily, left_index=True, right_index=True).dropna()
@@ -119,25 +126,21 @@ else:
     st.info(f"⚪ HOLD | corr={corr:.2f}")
 
 # =========================
-# ✅ Dashboard
+# Dashboard（图）
 # =========================
 col1, col2 = st.columns([1,2])
 
-# 情绪分布
 with col1:
     counts = df["label"].value_counts()
-
     fig_sent = go.Figure()
     fig_sent.add_bar(
         x=counts.index,
         y=counts.values,
         marker_color=["green" if x=="positive" else "red" for x in counts.index]
     )
-
     fig_sent.update_layout(height=250)
     st.plotly_chart(fig_sent, use_container_width=True)
 
-# 股价 + 情绪
 with col2:
     fig = go.Figure()
 
@@ -166,7 +169,7 @@ with col2:
     st.plotly_chart(fig, use_container_width=True)
 
 # =========================
-# ✅ TF-IDF 关键词
+# TF-IDF 关键词
 # =========================
 def extract_keywords(texts, top_k=10):
     vec = TfidfVectorizer(stop_words="english", max_features=50)
@@ -174,14 +177,13 @@ def extract_keywords(texts, top_k=10):
     scores = X.sum(axis=0).A1
     words = vec.get_feature_names_out()
 
-    kw = list(zip(words, scores))
-    kw = sorted(kw, key=lambda x: x[1], reverse=True)
+    kw = sorted(zip(words, scores), key=lambda x: x[1], reverse=True)
     return kw[:top_k]
 
 keywords = extract_keywords(df["title"].tolist())
 
 # =========================
-# ✅ 关键词情绪
+# 关键词情绪
 # =========================
 keyword_sentiment = {}
 
@@ -195,7 +197,7 @@ keyword_sentiment = {
 }
 
 # =========================
-# ✅ 词云 + 情绪
+# 词云 + 情绪
 # =========================
 st.markdown("### 🔑 Market Themes")
 
@@ -205,12 +207,7 @@ with colA:
 
     def get_color(word):
         val = keyword_sentiment.get(word, 0)
-        if val > 0.2:
-            return "green"
-        elif val < -0.2:
-            return "red"
-        else:
-            return "gray"
+        return "green" if val > 0.2 else "red" if val < -0.2 else "gray"
 
     wc = WordCloud(width=500, height=250, background_color="white")
     wc.generate_from_frequencies(dict(keywords))
@@ -233,23 +230,29 @@ with colB:
     )
 
     fig2.update_layout(height=250)
-
     st.plotly_chart(fig2, use_container_width=True)
 
 # =========================
-# ✅ AI Summary
+# ✅ Summary（容错）
 # =========================
 st.markdown("### 🧠 AI Summary")
 
-def generate_summary(titles):
-    try:
-        text = " ".join(titles[:5])[:500]
-        summary = summarizer(text, max_length=60, min_length=20)[0]["summary_text"]
-        return summary
-    except:
-        return "Market news focuses on earnings and macro trends."
+def generate_summary(titles, keywords):
+    if summarizer:
+        try:
+            text = " ".join(titles[:5])[:500]
+            return summarizer(text, max_length=60, min_length=20)[0]["summary_text"]
+        except:
+            pass
 
-st.success(generate_summary(df["title"].tolist()))
+    try:
+        main_kw = ", ".join([k for k, _ in keywords[:3]])
+        return f"Market news focuses on {main_kw} and reflects mixed sentiment."
+    except:
+        return "Market news highlights key developments."
+
+with st.spinner("Generating summary..."):
+    st.success(generate_summary(df["title"].tolist(), keywords))
 
 # =========================
 # ✅ 投资建议
@@ -269,26 +272,22 @@ def generate_advice(signal, trend, corr, keyword_sentiment):
 
 - Positive sentiment ({trend:.2f})
 - Strong correlation ({corr:.2f})
-- Driven by: {', '.join(kws)}
+- Drivers: {', '.join(kws)}
 
 ➡️ Strategy: short-term long
-
 ⚠️ Risk: sentiment reversal
 """
-
     elif signal == "SELL":
         return f"""
 📉 **SELL**
 
 - Negative sentiment ({trend:.2f})
-- Downward pressure from news
-- Key issues: {', '.join(kws)}
+- News pressure
+- Risks: {', '.join(kws)}
 
 ➡️ Strategy: reduce exposure
-
 ⚠️ Risk: rebound
 """
-
     else:
         return f"""
 📊 **HOLD**
@@ -297,7 +296,6 @@ def generate_advice(signal, trend, corr, keyword_sentiment):
 - Weak correlation ({corr:.2f})
 
 ➡️ Strategy: wait
-
 ⚠️ Risk: breakout
 """
 
@@ -305,7 +303,7 @@ trend = df_daily.tail(3).mean()
 st.markdown(generate_advice(signal, trend, corr, keyword_sentiment))
 
 # =========================
-# ✅ 新闻
+# 新闻
 # =========================
 st.markdown("### 📰 News")
 
