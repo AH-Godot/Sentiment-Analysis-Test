@@ -4,4 +4,3 @@ transformers
 torch
 pandas
 matplotlib
-yfinance
