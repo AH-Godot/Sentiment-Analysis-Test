@@ -1,5 +1,5 @@
 # =========================
-# 1. CRITICAL THREAD & RESOURCE LOCKS (Must be absolute first)
+# 1. CRITICAL THREAD & RESOURCE LOCKS
 # =========================
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -10,8 +10,7 @@ os.environ["OPENBLAS_NUM_THREADS"] = "1"
 # Lock PyTorch memory before it can spawn background threads
 import torch
 torch.set_num_threads(1)
-torch.set_num_interop_threads(1)
-torch.set_grad_enabled(False)
+torch.set_grad_enabled(False) # Prevents storing unnecessary training tensors
 
 import gc
 
