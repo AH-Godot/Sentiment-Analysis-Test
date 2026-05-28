@@ -1,5 +1,5 @@
 # =========================
-# ✅ 关键：防崩溃设置（必须最前面）
+# ✅ 防崩设置（必须最前）
 # =========================
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -23,6 +23,7 @@ from datetime import datetime, timedelta
 from sklearn.feature_extraction.text import TfidfVectorizer
 from wordcloud import WordCloud
 import matplotlib.pyplot as plt
+import re
 
 # =========================
 # 页面
@@ -33,27 +34,28 @@ st.title("📈 AI Stock Sentiment Dashboard")
 ticker = st.text_input("Ticker", "AAPL").upper()
 
 # =========================
-# ✅ 模型加载（轻量 + 容错）
+# ✅ 两个 pipeline
 # =========================
 @st.cache_resource
 def load_models():
+
     sentiment_model = pipeline(
         "sentiment-analysis",
         model="ProsusAI/finbert"
     )
 
-    summarizer = None
+    generator = None
     try:
-        summarizer = pipeline(
-            "text2text-generation",
-            model="google/flan-t5-small"
+        generator = pipeline(
+            "text-generation",
+            model="distilgpt2"
         )
     except:
-        pass  # fallback later
+        pass
 
-    return sentiment_model, summarizer
+    return sentiment_model, generator
 
-sentiment_model, summarizer = load_models()
+sentiment_model, generator = load_models()
 
 # =========================
 # 数据
@@ -141,9 +143,9 @@ else:
     st.info(f"⚪ HOLD | corr={corr:.2f}")
 
 # =========================
-# Dashboard
+# 图表
 # =========================
-col1, col2 = st.columns([1, 2])
+col1, col2 = st.columns([1,2])
 
 with col1:
     counts = df["label"].value_counts()
@@ -158,41 +160,26 @@ with col1:
 
 with col2:
     fig = go.Figure()
-
-    fig.add_trace(go.Scatter(
-        x=price_daily.index,
-        y=price_daily.values,
-        name="Price",
-        line=dict(color="blue", width=3)
-    ))
-
-    fig.add_trace(go.Scatter(
-        x=df_daily.index,
-        y=df_daily.values,
-        name="Sentiment",
-        yaxis="y2",
-        line=dict(color="red", width=3)
-    ))
+    fig.add_trace(go.Scatter(x=price_daily.index, y=price_daily, name="Price"))
+    fig.add_trace(go.Scatter(x=df_daily.index, y=df_daily, name="Sentiment", yaxis="y2"))
 
     fig.update_layout(
         height=300,
-        yaxis=dict(title="Price"),
-        yaxis2=dict(title="Sentiment", overlaying="y", side="right"),
-        legend=dict(orientation="h")
+        yaxis2=dict(overlaying="y", side="right")
     )
-
     st.plotly_chart(fig, use_container_width=True)
 
 # =========================
-# ✅ TF-IDF 关键词
+# ✅ TF-IDF关键词
 # =========================
-def extract_keywords(texts, top_k=10):
+def extract_keywords(texts):
     vec = TfidfVectorizer(stop_words="english", max_features=50)
     X = vec.fit_transform(texts)
+
     scores = X.sum(axis=0).A1
     words = vec.get_feature_names_out()
 
-    return sorted(zip(words, scores), key=lambda x: x[1], reverse=True)[:top_k]
+    return sorted(zip(words, scores), key=lambda x: x[1], reverse=True)[:10]
 
 keywords = extract_keywords(df["title"].tolist())
 
@@ -206,12 +193,10 @@ for _, row in df.iterrows():
         if word in row["title"].lower():
             keyword_sentiment.setdefault(word, []).append(row["score"])
 
-keyword_sentiment = {
-    k: sum(v)/len(v) for k, v in keyword_sentiment.items()
-}
+keyword_sentiment = {k: sum(v)/len(v) for k, v in keyword_sentiment.items()}
 
 # =========================
-# ✅ 可视化：词云 + 情绪
+# ✅ 词云
 # =========================
 st.markdown("### 🔑 Market Themes")
 
@@ -220,100 +205,96 @@ colA, colB = st.columns(2)
 with colA:
     def get_color(word):
         val = keyword_sentiment.get(word, 0)
-        return "green" if val > 0.2 else "red" if val < -0.2 else "gray"
+        return "green" if val > 0 else "red" if val < 0 else "gray"
 
-    wc = WordCloud(width=500, height=250, background_color="white")
+    wc = WordCloud(width=500, height=250)
     wc.generate_from_frequencies(dict(keywords))
     wc.recolor(color_func=lambda word, *args, **kwargs: get_color(word))
 
-    fig_wc, ax = plt.subplots(figsize=(5, 3))
+    fig, ax = plt.subplots(figsize=(5,3))
     ax.imshow(wc)
     ax.axis("off")
-    st.pyplot(fig_wc)
+    st.pyplot(fig)
 
 with colB:
     ks_df = pd.DataFrame(keyword_sentiment.items(), columns=["kw","sent"])
-
-    fig2 = go.Figure()
-    fig2.add_bar(
-        x=ks_df["kw"],
-        y=ks_df["sent"],
-        marker=dict(color=ks_df["sent"], colorscale=["red","gray","green"])
-    )
-    fig2.update_layout(height=250)
-    st.plotly_chart(fig2, use_container_width=True)
+    st.bar_chart(ks_df.set_index("kw"))
 
 # =========================
-# ✅ AI Summary（稳定版）
+# ✅ Summary（高级版）
 # =========================
-st.markdown("### 🧠 AI Summary")
+st.markdown("### 🧠 Market Summary")
 
-def generate_summary(titles, keywords):
-    if summarizer:
+def generate_summary(titles, keywords, keyword_sentiment, signal):
+
+    top_kw = [k for k, _ in keywords[:3]]
+    pos_kw = [k for k, v in keyword_sentiment.items() if v > 0]
+    neg_kw = [k for k, v in keyword_sentiment.items() if v < 0]
+
+    keyword_hint = ", ".join(top_kw)
+
+    tone = "positive" if signal == "BUY" else "negative" if signal == "SELL" else "neutral"
+
+    input_text = " ".join(titles[:5])[:300]
+
+    prompt = f"""
+You are a financial analyst.
+
+Write ONE professional sentence summarizing market sentiment.
+Tone: {tone}
+Focus on: {keyword_hint}
+Include both opportunity and risk.
+
+News:
+{input_text}
+
+Answer:
+"""
+
+    if generator:
         try:
-            text = " ".join(titles[:5])[:300]
+            result = generator(prompt, max_new_tokens=40, do_sample=False)[0]["generated_text"]
+            text = result.replace(prompt, "").strip()
 
-            return summarizer(
-                f"summarize: {text}",
-                max_length=50
-            )[0]["generated_text"]
+            match = re.search(r"(.+?\.)", text)
+            if match:
+                sentence = match.group(1)
+            else:
+                sentence = text[:200]
+
         except:
-            pass
-
-    # fallback
-    main_kw = ", ".join([k for k, _ in keywords[:3]])
-    return f"Market news focuses on {main_kw} with mixed sentiment."
-
-with st.spinner("Generating summary..."):
-    st.success(generate_summary(df["title"].tolist(), keywords))
-
-# =========================
-# ✅ 投资建议
-# =========================
-st.markdown("### 💡 Investment Advice")
-
-def generate_advice(signal, trend, corr, keyword_sentiment):
-
-    top_kw = sorted(keyword_sentiment.items(),
-                    key=lambda x: abs(x[1]), reverse=True)[:3]
-
-    kws = [k for k, _ in top_kw]
-
-    if signal == "BUY":
-        return f"""
-📈 **BUY**
-
-- Positive sentiment ({trend:.2f})
-- Strong correlation ({corr:.2f})
-- Drivers: {', '.join(kws)}
-
-➡️ Strategy: short-term long
-⚠️ Risk: sentiment reversal
-"""
-    elif signal == "SELL":
-        return f"""
-📉 **SELL**
-
-- Negative sentiment ({trend:.2f})
-- News pressure
-- Risks: {', '.join(kws)}
-
-➡️ Strategy: reduce exposure
-⚠️ Risk: rebound
-"""
+            sentence = None
     else:
-        return f"""
-📊 **HOLD**
+        sentence = None
 
-- Mixed signals ({trend:.2f})
-- Weak correlation ({corr:.2f})
+    if not sentence:
+        pos = ", ".join(pos_kw[:2]) or "limited upside"
+        neg = ", ".join(neg_kw[:2]) or "limited downside"
 
-➡️ Strategy: wait
-⚠️ Risk: breakout
+        if signal == "BUY":
+            sentence = f"Market sentiment is positive, supported by {pos}, though risks remain around {neg}."
+        elif signal == "SELL":
+            sentence = f"Market sentiment is negative, driven by {neg}, with limited support from {pos}."
+        else:
+            sentence = f"Market sentiment is mixed, with support from {pos} offset by risks in {neg}."
+
+    extra = f"""
+✅ **Opportunities:** {', '.join(pos_kw[:3]) or 'None'}  
+⚠️ **Risks:** {', '.join(neg_kw[:3]) or 'None'}
 """
 
-trend = df_daily.tail(3).mean()
-st.markdown(generate_advice(signal, trend, corr, keyword_sentiment))
+    return sentence, extra
+
+
+summary, extra = generate_summary(
+    df["title"].tolist(),
+    keywords,
+    keyword_sentiment,
+    signal
+)
+
+st.success(summary)
+st.markdown(extra)
 
 # =========================
 # 新闻
