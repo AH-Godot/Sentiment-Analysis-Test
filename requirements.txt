@@ -2,7 +2,7 @@ streamlit
 feedparser
 pandas
 yfinance
-transformers
+transformers>=4.30.0
 torch
 plotly
 scikit-learn
