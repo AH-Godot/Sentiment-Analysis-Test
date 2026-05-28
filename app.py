@@ -1,22 +1,39 @@
+# =========================
+# ✅ Anti-Crash Memory Settings
+# =========================
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+
 import streamlit as st
 import feedparser
 import pandas as pd
 import yfinance as yf
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
-import requests
+from transformers import pipeline
+import gc
 
-# =========================
-# Page Config
-# =========================
 st.set_page_config(page_title="AI Stock Dashboard", page_icon="📈", layout="wide")
 st.title("📈 AI Stock Sentiment Dashboard")
 
 ticker = st.text_input("Ticker Symbol (e.g., AAPL, TSLA)", "AAPL").upper()
 
-# TIP: Add your Hugging Face Token in Streamlit Cloud Secrets (Settings -> Secrets)
-HF_TOKEN = st.secrets.get("HF_TOKEN", "")
-HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
+# =========================
+# Local Model (Bypasses API Network Errors)
+# =========================
+@st.cache_resource(show_spinner=False)
+def load_sentiment_model():
+    # Loads model locally into RAM with memory-saving flags
+    return pipeline(
+        "sentiment-analysis", 
+        model="ProsusAI/finbert",
+        model_kwargs={"low_cpu_mem_usage": True}
+    )
+
+with st.spinner("Loading AI Model into memory..."):
+    sentiment_model = load_sentiment_model()
 
 # =========================
 # Core Data Fetching
@@ -25,7 +42,7 @@ HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
 def get_news(ticker_symbol):
     url = f"https://news.google.com/rss/search?q={ticker_symbol}%20stock&hl=en-US&gl=US&ceid=US:en"
     try:
-        return feedparser.parse(url).entries[:15] # Limit to 15 to keep API calls fast
+        return feedparser.parse(url).entries[:15]
     except Exception:
         return []
 
@@ -41,80 +58,44 @@ with st.spinner("Fetching market data..."):
     price = get_price(ticker)
 
 if not news or price.empty:
-    st.warning("Data unavailable for this ticker. Please try another symbol.")
+    st.warning("Data unavailable for this ticker.")
     st.stop()
 
 # =========================
-# Pipeline 1: Sentiment Analysis via API (BATCHED)
+# Local Sentiment Analysis
 # =========================
-def get_sentiments_batch(text_list):
-    # NOTE: Replace this URL with YOUR fine-tuned model URL once you upload it to Hugging Face!
-    API_URL = "https://api-inference.huggingface.co/models/ProsusAI/finbert"
-    
-    try:
-        # Send ALL titles in a single request to prevent Rate Limiting
-        response = requests.post(API_URL, headers=HEADERS, json={"inputs": text_list}, timeout=30)
-        
-        if response.status_code == 200:
-            results = response.json()
-            labels = []
-            for res in results:
-                # HF usually returns a nested list: [[{label: 'pos', score: 0.9}, ...]]
-                scores = res if isinstance(res, list) else [res]
-                best = max(scores, key=lambda x: x['score'])
-                labels.append(best['label'])
-            return labels
-        
-        elif response.status_code == 503:
-            st.warning("⏳ The AI model is currently waking up on Hugging Face. Please wait 15 seconds and refresh.")
-        else:
-            st.warning(f"⚠️ Hugging Face API Error {response.status_code}: {response.text}")
-            
-    except Exception as e:
-        st.warning(f"⚠️ API Connection Error: {e}")
-        
-    # Fallback: Return "neutral" for all if the API completely fails
-    return ["neutral"] * len(text_list)
-
 data = []
 with st.spinner("Analyzing Sentiment..."):
     week_ago = datetime.now().date() - timedelta(days=7)
     
-    # 1. Filter recent news first
-    filtered_news = []
     for entry in news:
         if not hasattr(entry, "published_parsed"): continue
         date = datetime(*entry.published_parsed[:6]).date()
-        if date >= week_ago: 
-            filtered_news.append(entry)
+        if date < week_ago: continue
             
-    # 2. Extract just the titles and send them to the API all at once
-    titles = [entry.title for entry in filtered_news]
-    
-    if titles:
-        # Call the batch function
-        labels = get_sentiments_batch(titles)
+        # Run inference locally instead of via API
+        result = sentiment_model(entry.title)[0]
+        label = result['label']
+        score = 1 if label == "positive" else -1 if label == "negative" else 0
         
-        # 3. Map the results back to your data dictionary
-        for entry, label in zip(filtered_news, labels):
-            date = datetime(*entry.published_parsed[:6]).date()
-            score = 1 if label == "positive" else -1 if label == "negative" else 0
-            
-            data.append({
-                "date": date, 
-                "label": label, 
-                "score": score, 
-                "title": entry.title,
-                "link": getattr(entry, 'link', '#') 
-            })
+        data.append({
+            "date": date, 
+            "label": label, 
+            "score": score, 
+            "title": entry.title,
+            "link": getattr(entry, 'link', '#') 
+        })
+        
+    # Free up memory after the loop finishes
+    gc.collect()
 
 df = pd.DataFrame(data)
 if df.empty:
     st.warning("No recent sentiment data available.")
     st.stop()
-    
+
 # =========================
-# ✅ Sentiment Counting Indicator
+# Sentiment Counting Indicator
 # =========================
 st.markdown("### 📊 Sentiment Overview")
 pos_count = len(df[df['label'] == 'positive'])
@@ -127,78 +108,54 @@ col2.metric("🔴 Negative News", neg_count)
 col3.metric("⚪ Neutral News", neu_count)
 
 # =========================
-# Charts & Visuals (MultiIndex Fix applied)
+# Charts & Visuals
 # =========================
 df_daily = df.groupby("date")["score"].mean().rolling(2, min_periods=1).mean()
 
 close_col = price["Close"]
 if isinstance(close_col, pd.DataFrame):
     close_col = close_col.iloc[:, 0]
-
 price_daily = close_col.groupby(price.index.date).mean()
 
 fig = go.Figure()
 fig.add_trace(go.Scatter(
-    x=price_daily.index, 
-    y=price_daily.values, 
-    mode='lines+markers',
-    name="Stock Price", 
-    line=dict(color='blue')
+    x=price_daily.index, y=price_daily.values, 
+    mode='lines+markers', name="Stock Price", line=dict(color='blue')
 ))
-
 fig.add_trace(go.Scatter(
-    x=df_daily.index, 
-    y=df_daily.values, 
-    mode='lines+markers', 
-    name="Sentiment Score", 
-    yaxis="y2", 
-    line=dict(color='orange')
+    x=df_daily.index, y=df_daily.values, 
+    mode='lines+markers', name="Sentiment Score", yaxis="y2", line=dict(color='orange')
 ))
 
 fig.update_layout(
     title=f"{ticker} Price vs Sentiment Trend",
     yaxis2=dict(overlaying="y", side="right", showgrid=False),
-    height=400,
-    margin=dict(l=0, r=0, t=40, b=0)
+    height=400, margin=dict(l=0, r=0, t=40, b=0)
 )
 st.plotly_chart(fig, use_container_width=True)
 
 # =========================
-# Pipeline 2: Market Summary via API
+# Rule-Based Market Summary (No 2nd Model Needed)
 # =========================
-st.markdown("### 🧠 AI Market Summary")
+st.markdown("### 🧠 Market Summary")
+trend = "positive" if df_daily.iloc[-1] > 0 else "negative" if df_daily.iloc[-1] < 0 else "neutral"
 
-def get_summary(news_titles, sentiment_trend):
-    API_URL = "https://api-inference.huggingface.co/models/distilgpt2"
-    prompt = f"The stock sentiment is currently {sentiment_trend}. Based on news like '{news_titles[0]}', the market outlook is: "
-    
-    try:
-        response = requests.post(
-            API_URL, 
-            headers=HEADERS, 
-            json={"inputs": prompt, "parameters": {"max_new_tokens": 30}}, 
-            timeout=10
-        )
-        if response.status_code == 200:
-            result = response.json()[0]["generated_text"]
-            return result.replace(prompt, "").split('.')[0] + "." 
-    except Exception:
-        pass
-    
-    return f"The market remains actively traded with a {sentiment_trend} tilt based on recent headlines."
+pos_headlines = df[df['label'] == 'positive']['title'].tolist()
+neg_headlines = df[df['label'] == 'negative']['title'].tolist()
 
-with st.spinner("Generating Summary..."):
-    trend = "positive" if df_daily.iloc[-1] > 0 else "negative" if df_daily.iloc[-1] < 0 else "neutral"
-    titles = df["title"].tolist()
-    summary = get_summary(titles, trend)
-    
+if trend == "positive" and pos_headlines:
+    summary = f"Market sentiment is structurally positive. Key catalyst: '{pos_headlines[0]}'"
+elif trend == "negative" and neg_headlines:
+    summary = f"Market sentiment leans negative, driven primarily by risks such as: '{neg_headlines[0]}'"
+else:
+    summary = f"Market sentiment is highly mixed and currently tracking {trend}."
+
 st.success(summary)
 
 # =========================
-# ✅ News Feed (Now with clickable links)
+# News Feed
 # =========================
 st.markdown("### 📰 Recent Headlines")
 for _, row in df.head(10).iterrows():
     emoji = "🟢" if row["label"] == "positive" else "🔴" if row["label"] == "negative" else "⚪"
-    # Converts the title into a clickable markdown hyperlink
     st.markdown(f"{emoji} [{row['title']}]({row['link']})")
