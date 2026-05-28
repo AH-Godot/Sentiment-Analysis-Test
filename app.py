@@ -45,48 +45,74 @@ if not news or price.empty:
     st.stop()
 
 # =========================
-# Pipeline 1: Sentiment Analysis via API
+# Pipeline 1: Sentiment Analysis via API (BATCHED)
 # =========================
-def get_sentiment(text):
+def get_sentiments_batch(text_list):
     # NOTE: Replace this URL with YOUR fine-tuned model URL once you upload it to Hugging Face!
     API_URL = "https://api-inference.huggingface.co/models/ProsusAI/finbert"
     
     try:
-        response = requests.post(API_URL, headers=HEADERS, json={"inputs": text}, timeout=10)
+        # Send ALL titles in a single request to prevent Rate Limiting
+        response = requests.post(API_URL, headers=HEADERS, json={"inputs": text_list}, timeout=30)
+        
         if response.status_code == 200:
-            results = response.json()[0]
-            best = max(results, key=lambda x: x['score'])
-            return best['label']
-    except Exception:
-        pass
-    return "neutral" # Fallback if API fails
+            results = response.json()
+            labels = []
+            for res in results:
+                # HF usually returns a nested list: [[{label: 'pos', score: 0.9}, ...]]
+                scores = res if isinstance(res, list) else [res]
+                best = max(scores, key=lambda x: x['score'])
+                labels.append(best['label'])
+            return labels
+        
+        elif response.status_code == 503:
+            st.warning("⏳ The AI model is currently waking up on Hugging Face. Please wait 15 seconds and refresh.")
+        else:
+            st.warning(f"⚠️ Hugging Face API Error {response.status_code}: {response.text}")
+            
+    except Exception as e:
+        st.warning(f"⚠️ API Connection Error: {e}")
+        
+    # Fallback: Return "neutral" for all if the API completely fails
+    return ["neutral"] * len(text_list)
 
 data = []
 with st.spinner("Analyzing Sentiment..."):
     week_ago = datetime.now().date() - timedelta(days=7)
     
+    # 1. Filter recent news first
+    filtered_news = []
     for entry in news:
         if not hasattr(entry, "published_parsed"): continue
         date = datetime(*entry.published_parsed[:6]).date()
-        if date < week_ago: continue
+        if date >= week_ago: 
+            filtered_news.append(entry)
             
-        label = get_sentiment(entry.title)
-        score = 1 if label == "positive" else -1 if label == "negative" else 0
+    # 2. Extract just the titles and send them to the API all at once
+    titles = [entry.title for entry in filtered_news]
+    
+    if titles:
+        # Call the batch function
+        labels = get_sentiments_batch(titles)
         
-        # ✅ Added 'link' to the data dictionary
-        data.append({
-            "date": date, 
-            "label": label, 
-            "score": score, 
-            "title": entry.title,
-            "link": entry.link 
-        })
+        # 3. Map the results back to your data dictionary
+        for entry, label in zip(filtered_news, labels):
+            date = datetime(*entry.published_parsed[:6]).date()
+            score = 1 if label == "positive" else -1 if label == "negative" else 0
+            
+            data.append({
+                "date": date, 
+                "label": label, 
+                "score": score, 
+                "title": entry.title,
+                "link": getattr(entry, 'link', '#') 
+            })
 
 df = pd.DataFrame(data)
 if df.empty:
     st.warning("No recent sentiment data available.")
     st.stop()
-
+    
 # =========================
 # ✅ Sentiment Counting Indicator
 # =========================
