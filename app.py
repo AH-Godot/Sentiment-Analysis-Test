@@ -1,10 +1,11 @@
 # =========================
-# ✅ Anti-Crash Memory Settings
+# ✅ 1. CRITICAL THREAD LOCKS (Must be first)
 # =========================
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
 import streamlit as st
 import feedparser
@@ -13,7 +14,13 @@ import yfinance as yf
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
 from transformers import pipeline
+import torch
 import gc
+
+# ✅ 2. PYTORCH RAM & THREAD LOCK
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
+torch.set_grad_enabled(False) # Massive RAM saver: prevents PyTorch from storing memory for model training
 
 st.set_page_config(page_title="AI Stock Dashboard", page_icon="📈", layout="wide")
 st.title("📈 AI Stock Sentiment Dashboard")
@@ -21,16 +28,12 @@ st.title("📈 AI Stock Sentiment Dashboard")
 ticker = st.text_input("Ticker Symbol (e.g., AAPL, TSLA)", "AAPL").upper()
 
 # =========================
-# Local Model (Bypasses API Network Errors)
+# Local Model 
 # =========================
 @st.cache_resource(show_spinner=False)
 def load_sentiment_model():
-    # Loads model locally into RAM with memory-saving flags
-    return pipeline(
-        "sentiment-analysis", 
-        model="ProsusAI/finbert",
-        model_kwargs={"low_cpu_mem_usage": True}
-    )
+    # Standard loading (without accelerate/low_cpu_mem_usage to avoid semaphore crashes)
+    return pipeline("sentiment-analysis", model="ProsusAI/finbert")
 
 with st.spinner("Loading AI Model into memory..."):
     sentiment_model = load_sentiment_model()
@@ -49,7 +52,8 @@ def get_news(ticker_symbol):
 @st.cache_data(ttl=600, show_spinner=False)
 def get_price(ticker_symbol):
     try:
-        return yf.download(ticker_symbol, period="7d", interval="1h")
+        # ✅ 3. YFINANCE FIX: threads=False stops the semaphore leaks!
+        return yf.download(ticker_symbol, period="7d", interval="1h", threads=False)
     except Exception:
         return pd.DataFrame()
 
@@ -73,7 +77,6 @@ with st.spinner("Analyzing Sentiment..."):
         date = datetime(*entry.published_parsed[:6]).date()
         if date < week_ago: continue
             
-        # Run inference locally instead of via API
         result = sentiment_model(entry.title)[0]
         label = result['label']
         score = 1 if label == "positive" else -1 if label == "negative" else 0
@@ -86,7 +89,6 @@ with st.spinner("Analyzing Sentiment..."):
             "link": getattr(entry, 'link', '#') 
         })
         
-    # Free up memory after the loop finishes
     gc.collect()
 
 df = pd.DataFrame(data)
@@ -135,7 +137,7 @@ fig.update_layout(
 st.plotly_chart(fig, use_container_width=True)
 
 # =========================
-# Rule-Based Market Summary (No 2nd Model Needed)
+# Rule-Based Market Summary
 # =========================
 st.markdown("### 🧠 Market Summary")
 trend = "positive" if df_daily.iloc[-1] > 0 else "negative" if df_daily.iloc[-1] < 0 else "neutral"
