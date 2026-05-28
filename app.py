@@ -1,86 +1,168 @@
 import streamlit as st
 import feedparser
 import pandas as pd
+import yfinance as yf
 from transformers import pipeline
 import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
+from collections import Counter
 
-# 页面配置
-st.set_page_config(page_title="US Stock Sentiment", layout="wide")
+# 页面
+st.set_page_config(page_title="Stock Sentiment Dashboard", layout="wide")
+st.title("📈 美股情感分析 + 股价联动")
 
-st.title("📈 美股新闻情感分析仪")
+ticker = st.text_input("输入股票代码", "AAPL").upper()
 
-# 用户输入
-ticker = st.text_input("输入股票代码（如 AAPL, TSLA）", "AAPL")
-
-# 缓存模型（避免重复加载）
+# -------------------------
+# 模型加载
+# -------------------------
 @st.cache_resource
 def load_model():
     return pipeline("sentiment-analysis", model="ProsusAI/finbert")
 
 model = load_model()
 
-# 缓存数据（10分钟）
+# -------------------------
+# 数据获取
+# -------------------------
 @st.cache_data(ttl=600)
-def fetch_news(ticker):
+def get_news(ticker):
     url = f"https://news.google.com/rss/search?q={ticker}%20stock&hl=en-US&gl=US&ceid=US:en"
-    feed = feedparser.parse(url)
-    return feed.entries
+    return feedparser.parse(url).entries
 
-# 获取新闻
-entries = fetch_news(ticker)
+@st.cache_data(ttl=600)
+def get_price(ticker):
+    return yf.download(ticker, period="7d", interval="1h")
 
-if len(entries) == 0:
-    st.warning("没有找到相关新闻")
-else:
-    results = []
+news = get_news(ticker)
+price = get_price(ticker)
 
-    st.subheader(f"📰 最新新闻（{ticker}）")
+# -------------------------
+# 情感分析 + 最近一周
+# -------------------------
+sentiment_data = []
+week_ago = datetime.now().date() - timedelta(days=7)
 
-    for entry in entries[:15]:
-        title = entry.title
+for entry in news[:50]:
+    title = entry.title
 
-        # 情感分析
-        sentiment = model(title)[0]
-        label = sentiment["label"]
-        score = sentiment["score"]
+    if hasattr(entry, "published_parsed"):
+        date = datetime(*entry.published_parsed[:6]).date()
+    else:
+        continue
 
-        if label == "positive":
-            emoji = "🟢"
-        elif label == "negative":
-            emoji = "🔴"
-        else:
-            emoji = "⚪"
+    if date < week_ago:
+        continue
 
-        st.markdown(f"### {emoji} {title}")
-        st.write(f"情感: {label} | 置信度: {score:.2f}")
-        st.write(entry.link)
-        st.write("---")
+    result = model(title)[0]
+    label = result["label"]
 
-        results.append(label)
+    score = 0
+    if label == "positive":
+        score = 1
+    elif label == "negative":
+        score = -1
+
+    sentiment_data.append({
+        "date": date,
+        "label": label,
+        "score": score,
+        "title": title
+    })
+
+df = pd.DataFrame(sentiment_data)
+
+# =========================
+# ✅ ⭐ 一周情绪总览（核心）
+# =========================
+st.header("🧠 最近一周市场情绪总览")
+
+if len(df) > 0:
 
     # 情感统计
-    st.subheader("📊 情感分布")
+    counts = Counter(df["label"])
 
-    df = pd.Series(results).value_counts()
+    # ✅ 图1：情感分布
+    fig1, ax1 = plt.subplots()
+    ax1.bar(counts.keys(), counts.values())
+    ax1.set_title("Sentiment Distribution (7 Days)")
 
-    fig, ax = plt.subplots()
-    df.plot(kind="bar", ax=ax)
-    ax.set_title("Sentiment Distribution")
+    st.pyplot(fig1)
 
-    st.pyplot(fig)
+    # ✅ 情绪结论
+    avg_score = df["score"].mean()
 
-    # 总结
-    st.subheader("📌 情绪总结")
-
-    total = len(results)
-    pos = results.count("positive")
-    neg = results.count("negative")
-
-    sentiment_score = (pos - neg) / total
-
-    if sentiment_score > 0.2:
-        st.success("整体情绪：偏乐观 🟢")
-    elif sentiment_score < -0.2:
-        st.error("整体情绪：偏悲观 🔴")
+    if avg_score > 0.2:
+        sentiment_summary = "整体偏乐观 🟢"
+        st.success(f"📌 结论：{sentiment_summary}")
+    elif avg_score < -0.2:
+        sentiment_summary = "整体偏悲观 🔴"
+        st.error(f"📌 结论：{sentiment_summary}")
     else:
-        st.info("整体情绪：中性 ⚪")
+        sentiment_summary = "整体偏中性 ⚪"
+        st.info(f"📌 结论：{sentiment_summary}")
+
+    # =========================
+    # ✅ ⭐ 新闻总结（自动）
+    # =========================
+    st.subheader("📰 本周新闻总结")
+
+    # 按情绪挑选代表新闻
+    top_positive = df[df["score"] == 1]["title"].head(3).tolist()
+    top_negative = df[df["score"] == -1]["title"].head(3).tolist()
+
+    summary_text = "### 🔎 市场关键信号\n"
+
+    if top_positive:
+        summary_text += "\n🟢 利好消息：\n"
+        for t in top_positive:
+            summary_text += f"- {t}\n"
+
+    if top_negative:
+        summary_text += "\n🔴 利空消息：\n"
+        for t in top_negative:
+            summary_text += f"- {t}\n"
+
+    summary_text += f"\n📊 本周整体情绪：{sentiment_summary}"
+
+    st.markdown(summary_text)
+
+else:
+    st.warning("本周没有足够新闻数据")
+
+# =========================
+# ✅ 股价 + 情感联动
+# =========================
+st.header("📊 股价 + 情感联动分析")
+
+if len(df) > 0:
+
+    df_daily = df.groupby("date")["score"].mean()
+
+    price["date"] = price.index.date
+    price_daily = price.groupby("date")["Close"].mean()
+
+    fig2, ax1 = plt.subplots(figsize=(10, 5))
+
+    # 股价
+    ax1.plot(price_daily.index, price_daily.values)
+    ax1.set_ylabel("Stock Price")
+
+    # 情感
+    ax2 = ax1.twinx()
+    ax2.plot(df_daily.index, df_daily.values)
+    ax2.set_ylabel("Sentiment")
+
+    plt.title(f"{ticker} Price vs Sentiment")
+
+    st.pyplot(fig2)
+
+# =========================
+# ✅ 新闻列表
+# =========================
+st.header("📰 新闻详情")
+
+for entry in news[:10]:
+    st.markdown(f"**{entry.title}**")
+    st.write(entry.link)
+    st.write("---")
