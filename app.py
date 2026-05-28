@@ -3,28 +3,34 @@ import feedparser
 import pandas as pd
 import yfinance as yf
 from transformers import pipeline
-import matplotlib.pyplot as plt
+import plotly.graph_objects as go
 from datetime import datetime, timedelta
-from collections import Counter
+from sklearn.feature_extraction.text import TfidfVectorizer
+from wordcloud import WordCloud
+import matplotlib.pyplot as plt
 
+# =========================
 # 页面
-st.set_page_config(page_title="Stock Sentiment Dashboard", layout="wide")
-st.title("📈 美股情感分析 + 股价联动")
+# =========================
+st.set_page_config(page_title="AI Stock Dashboard", layout="wide")
+st.title("📈 AI Stock Sentiment Dashboard")
 
-ticker = st.text_input("输入股票代码", "AAPL").upper()
+ticker = st.text_input("Ticker", "AAPL").upper()
 
-# -------------------------
-# 模型加载
-# -------------------------
+# =========================
+# ✅ 两个 pipeline
+# =========================
 @st.cache_resource
-def load_model():
-    return pipeline("sentiment-analysis", model="ProsusAI/finbert")
+def load_models():
+    sentiment_model = pipeline("sentiment-analysis", model="ProsusAI/finbert")
+    summarizer = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
+    return sentiment_model, summarizer
 
-model = load_model()
+sentiment_model, summarizer = load_models()
 
-# -------------------------
-# 数据获取
-# -------------------------
+# =========================
+# 数据
+# =========================
 @st.cache_data(ttl=600)
 def get_news(ticker):
     url = f"https://news.google.com/rss/search?q={ticker}%20stock&hl=en-US&gl=US&ceid=US:en"
@@ -37,132 +43,273 @@ def get_price(ticker):
 news = get_news(ticker)
 price = get_price(ticker)
 
-# -------------------------
-# 情感分析 + 最近一周
-# -------------------------
-sentiment_data = []
+# =========================
+# 情感分析
+# =========================
 week_ago = datetime.now().date() - timedelta(days=7)
 
-for entry in news[:50]:
-    title = entry.title
+data = []
 
-    if hasattr(entry, "published_parsed"):
-        date = datetime(*entry.published_parsed[:6]).date()
-    else:
+for entry in news[:50]:
+    if not hasattr(entry, "published_parsed"):
         continue
 
+    date = datetime(*entry.published_parsed[:6]).date()
     if date < week_ago:
         continue
 
-    result = model(title)[0]
-    label = result["label"]
+    title = entry.title
+    result = sentiment_model(title)[0]
 
     score = 0
-    if label == "positive":
+    if result["label"] == "positive":
         score = 1
-    elif label == "negative":
+    elif result["label"] == "negative":
         score = -1
 
-    sentiment_data.append({
+    data.append({
         "date": date,
-        "label": label,
+        "label": result["label"],
         "score": score,
         "title": title
     })
 
-df = pd.DataFrame(sentiment_data)
+df = pd.DataFrame(data)
+
+if df.empty:
+    st.warning("No data")
+    st.stop()
 
 # =========================
-# ✅ ⭐ 一周情绪总览（核心）
+# 时间序列
 # =========================
-st.header("🧠 最近一周市场情绪总览")
+df_daily = df.groupby("date")["score"].mean().rolling(2).mean()
 
-if len(df) > 0:
+price["date"] = price.index.date
+price_daily = price.groupby("date")["Close"].mean()
 
-    # 情感统计
-    counts = Counter(df["label"])
+# =========================
+# ✅ Trading Signal
+# =========================
+def generate_signal(df_daily, price_daily):
+    merged = pd.merge(price_daily, df_daily, left_index=True, right_index=True).dropna()
 
-    # ✅ 图1：情感分布
-    fig1, ax1 = plt.subplots()
-    ax1.bar(counts.keys(), counts.values())
-    ax1.set_title("Sentiment Distribution (7 Days)")
+    if len(merged) < 3:
+        return "HOLD", 0
 
-    st.pyplot(fig1)
+    corr = merged.iloc[:, 0].corr(merged.iloc[:, 1])
+    trend = df_daily.tail(3).mean()
 
-    # ✅ 情绪结论
-    avg_score = df["score"].mean()
-
-    if avg_score > 0.2:
-        sentiment_summary = "整体偏乐观 🟢"
-        st.success(f"📌 结论：{sentiment_summary}")
-    elif avg_score < -0.2:
-        sentiment_summary = "整体偏悲观 🔴"
-        st.error(f"📌 结论：{sentiment_summary}")
+    if trend > 0.3 and corr > 0.2:
+        return "BUY", corr
+    elif trend < -0.3 and corr > 0.2:
+        return "SELL", corr
     else:
-        sentiment_summary = "整体偏中性 ⚪"
-        st.info(f"📌 结论：{sentiment_summary}")
+        return "HOLD", corr
 
-    # =========================
-    # ✅ ⭐ 新闻总结（自动）
-    # =========================
-    st.subheader("📰 本周新闻总结")
+signal, corr = generate_signal(df_daily, price_daily)
 
-    # 按情绪挑选代表新闻
-    top_positive = df[df["score"] == 1]["title"].head(3).tolist()
-    top_negative = df[df["score"] == -1]["title"].head(3).tolist()
+st.markdown("## 🚦 Trading Signal")
 
-    summary_text = "### 🔎 市场关键信号\n"
-
-    if top_positive:
-        summary_text += "\n🟢 利好消息：\n"
-        for t in top_positive:
-            summary_text += f"- {t}\n"
-
-    if top_negative:
-        summary_text += "\n🔴 利空消息：\n"
-        for t in top_negative:
-            summary_text += f"- {t}\n"
-
-    summary_text += f"\n📊 本周整体情绪：{sentiment_summary}"
-
-    st.markdown(summary_text)
-
+if signal == "BUY":
+    st.success(f"🟢 BUY | corr={corr:.2f}")
+elif signal == "SELL":
+    st.error(f"🔴 SELL | corr={corr:.2f}")
 else:
-    st.warning("本周没有足够新闻数据")
+    st.info(f"⚪ HOLD | corr={corr:.2f}")
 
 # =========================
-# ✅ 股价 + 情感联动
+# ✅ Dashboard
 # =========================
-st.header("📊 股价 + 情感联动分析")
+col1, col2 = st.columns([1,2])
 
-if len(df) > 0:
+# 情绪分布
+with col1:
+    counts = df["label"].value_counts()
 
-    df_daily = df.groupby("date")["score"].mean()
+    fig_sent = go.Figure()
+    fig_sent.add_bar(
+        x=counts.index,
+        y=counts.values,
+        marker_color=["green" if x=="positive" else "red" for x in counts.index]
+    )
 
-    price["date"] = price.index.date
-    price_daily = price.groupby("date")["Close"].mean()
+    fig_sent.update_layout(height=250)
+    st.plotly_chart(fig_sent, use_container_width=True)
 
-    fig2, ax1 = plt.subplots(figsize=(10, 5))
+# 股价 + 情绪
+with col2:
+    fig = go.Figure()
 
-    # 股价
-    ax1.plot(price_daily.index, price_daily.values)
-    ax1.set_ylabel("Stock Price")
+    fig.add_trace(go.Scatter(
+        x=price_daily.index,
+        y=price_daily.values,
+        name="Price",
+        line=dict(color="blue", width=3)
+    ))
 
-    # 情感
-    ax2 = ax1.twinx()
-    ax2.plot(df_daily.index, df_daily.values)
-    ax2.set_ylabel("Sentiment")
+    fig.add_trace(go.Scatter(
+        x=df_daily.index,
+        y=df_daily.values,
+        name="Sentiment",
+        yaxis="y2",
+        line=dict(color="red", width=3)
+    ))
 
-    plt.title(f"{ticker} Price vs Sentiment")
+    fig.update_layout(
+        height=300,
+        yaxis=dict(title="Price"),
+        yaxis2=dict(title="Sentiment", overlaying="y", side="right"),
+        legend=dict(orientation="h")
+    )
 
-    st.pyplot(fig2)
+    st.plotly_chart(fig, use_container_width=True)
 
 # =========================
-# ✅ 新闻列表
+# ✅ TF-IDF 关键词
 # =========================
-st.header("📰 新闻详情")
+def extract_keywords(texts, top_k=10):
+    vec = TfidfVectorizer(stop_words="english", max_features=50)
+    X = vec.fit_transform(texts)
+    scores = X.sum(axis=0).A1
+    words = vec.get_feature_names_out()
+
+    kw = list(zip(words, scores))
+    kw = sorted(kw, key=lambda x: x[1], reverse=True)
+    return kw[:top_k]
+
+keywords = extract_keywords(df["title"].tolist())
+
+# =========================
+# ✅ 关键词情绪
+# =========================
+keyword_sentiment = {}
+
+for _, row in df.iterrows():
+    for word, _ in keywords:
+        if word in row["title"].lower():
+            keyword_sentiment.setdefault(word, []).append(row["score"])
+
+keyword_sentiment = {
+    k: sum(v)/len(v) for k, v in keyword_sentiment.items()
+}
+
+# =========================
+# ✅ 词云 + 情绪
+# =========================
+st.markdown("### 🔑 Market Themes")
+
+colA, colB = st.columns(2)
+
+with colA:
+
+    def get_color(word):
+        val = keyword_sentiment.get(word, 0)
+        if val > 0.2:
+            return "green"
+        elif val < -0.2:
+            return "red"
+        else:
+            return "gray"
+
+    wc = WordCloud(width=500, height=250, background_color="white")
+    wc.generate_from_frequencies(dict(keywords))
+    wc.recolor(color_func=lambda word, *args, **kwargs: get_color(word))
+
+    fig, ax = plt.subplots(figsize=(5,3))
+    ax.imshow(wc)
+    ax.axis("off")
+
+    st.pyplot(fig)
+
+with colB:
+    ks_df = pd.DataFrame(keyword_sentiment.items(), columns=["kw","sent"])
+
+    fig2 = go.Figure()
+    fig2.add_bar(
+        x=ks_df["kw"],
+        y=ks_df["sent"],
+        marker=dict(color=ks_df["sent"], colorscale=["red","gray","green"])
+    )
+
+    fig2.update_layout(height=250)
+
+    st.plotly_chart(fig2, use_container_width=True)
+
+# =========================
+# ✅ AI Summary
+# =========================
+st.markdown("### 🧠 AI Summary")
+
+def generate_summary(titles):
+    try:
+        text = " ".join(titles[:5])[:500]
+        summary = summarizer(text, max_length=60, min_length=20)[0]["summary_text"]
+        return summary
+    except:
+        return "Market news focuses on earnings and macro trends."
+
+st.success(generate_summary(df["title"].tolist()))
+
+# =========================
+# ✅ 投资建议
+# =========================
+st.markdown("### 💡 Investment Advice")
+
+def generate_advice(signal, trend, corr, keyword_sentiment):
+
+    top_kw = sorted(keyword_sentiment.items(),
+                    key=lambda x: abs(x[1]), reverse=True)[:3]
+
+    kws = [k for k, _ in top_kw]
+
+    if signal == "BUY":
+        return f"""
+📈 **BUY**
+
+- Positive sentiment ({trend:.2f})
+- Strong correlation ({corr:.2f})
+- Driven by: {', '.join(kws)}
+
+➡️ Strategy: short-term long
+
+⚠️ Risk: sentiment reversal
+"""
+
+    elif signal == "SELL":
+        return f"""
+📉 **SELL**
+
+- Negative sentiment ({trend:.2f})
+- Downward pressure from news
+- Key issues: {', '.join(kws)}
+
+➡️ Strategy: reduce exposure
+
+⚠️ Risk: rebound
+"""
+
+    else:
+        return f"""
+📊 **HOLD**
+
+- Mixed signals ({trend:.2f})
+- Weak correlation ({corr:.2f})
+
+➡️ Strategy: wait
+
+⚠️ Risk: breakout
+"""
+
+trend = df_daily.tail(3).mean()
+st.markdown(generate_advice(signal, trend, corr, keyword_sentiment))
+
+# =========================
+# ✅ 新闻
+# =========================
+st.markdown("### 📰 News")
 
 for entry in news[:10]:
-    st.markdown(f"**{entry.title}**")
+    st.write(f"• {entry.title}")
     st.write(entry.link)
     st.write("---")
