@@ -1,7 +1,10 @@
 streamlit
 feedparser
+pandas
+yfinance
 transformers
 torch
-pandas
-matplotlib
 plotly
+scikit-learn
+wordcloud
+matplotlib
