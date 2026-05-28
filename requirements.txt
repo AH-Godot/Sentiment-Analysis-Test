@@ -7,4 +7,3 @@ yfinance
 plotly
 transformers==4.36.2
 torch
-accelerate
