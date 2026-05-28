@@ -15,7 +15,6 @@ st.title("📈 AI Stock Sentiment Dashboard")
 ticker = st.text_input("Ticker Symbol (e.g., AAPL, TSLA)", "AAPL").upper()
 
 # TIP: Add your Hugging Face Token in Streamlit Cloud Secrets (Settings -> Secrets)
-# Example: HF_TOKEN = "hf_your_token_here"
 HF_TOKEN = st.secrets.get("HF_TOKEN", "")
 HEADERS = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
 
@@ -56,7 +55,6 @@ def get_sentiment(text):
         response = requests.post(API_URL, headers=HEADERS, json={"inputs": text}, timeout=10)
         if response.status_code == 200:
             results = response.json()[0]
-            # Find the label with the highest score
             best = max(results, key=lambda x: x['score'])
             return best['label']
     except Exception:
@@ -75,7 +73,14 @@ with st.spinner("Analyzing Sentiment..."):
         label = get_sentiment(entry.title)
         score = 1 if label == "positive" else -1 if label == "negative" else 0
         
-        data.append({"date": date, "label": label, "score": score, "title": entry.title})
+        # ✅ Added 'link' to the data dictionary
+        data.append({
+            "date": date, 
+            "label": label, 
+            "score": score, 
+            "title": entry.title,
+            "link": entry.link 
+        })
 
 df = pd.DataFrame(data)
 if df.empty:
@@ -83,15 +88,46 @@ if df.empty:
     st.stop()
 
 # =========================
-# Charts & Visuals
+# ✅ Sentiment Counting Indicator
+# =========================
+st.markdown("### 📊 Sentiment Overview")
+pos_count = len(df[df['label'] == 'positive'])
+neg_count = len(df[df['label'] == 'negative'])
+neu_count = len(df[df['label'] == 'neutral'])
+
+col1, col2, col3 = st.columns(3)
+col1.metric("🟢 Positive News", pos_count)
+col2.metric("🔴 Negative News", neg_count)
+col3.metric("⚪ Neutral News", neu_count)
+
+# =========================
+# Charts & Visuals (MultiIndex Fix applied)
 # =========================
 df_daily = df.groupby("date")["score"].mean().rolling(2, min_periods=1).mean()
-price["date"] = price.index.date
-price_daily = price.groupby("date")["Close"].mean()
+
+close_col = price["Close"]
+if isinstance(close_col, pd.DataFrame):
+    close_col = close_col.iloc[:, 0]
+
+price_daily = close_col.groupby(price.index.date).mean()
 
 fig = go.Figure()
-fig.add_trace(go.Scatter(x=price_daily.index, y=price_daily, name="Stock Price", line=dict(color='blue')))
-fig.add_trace(go.Scatter(x=df_daily.index, y=df_daily, name="Sentiment Score", yaxis="y2", line=dict(color='orange')))
+fig.add_trace(go.Scatter(
+    x=price_daily.index, 
+    y=price_daily.values, 
+    mode='lines+markers',
+    name="Stock Price", 
+    line=dict(color='blue')
+))
+
+fig.add_trace(go.Scatter(
+    x=df_daily.index, 
+    y=df_daily.values, 
+    mode='lines+markers', 
+    name="Sentiment Score", 
+    yaxis="y2", 
+    line=dict(color='orange')
+))
 
 fig.update_layout(
     title=f"{ticker} Price vs Sentiment Trend",
@@ -119,11 +155,10 @@ def get_summary(news_titles, sentiment_trend):
         )
         if response.status_code == 200:
             result = response.json()[0]["generated_text"]
-            return result.replace(prompt, "").split('.')[0] + "." # Clean up output
+            return result.replace(prompt, "").split('.')[0] + "." 
     except Exception:
         pass
     
-    # Safe Fallback
     return f"The market remains actively traded with a {sentiment_trend} tilt based on recent headlines."
 
 with st.spinner("Generating Summary..."):
@@ -134,9 +169,10 @@ with st.spinner("Generating Summary..."):
 st.success(summary)
 
 # =========================
-# News Feed
+# ✅ News Feed (Now with clickable links)
 # =========================
 st.markdown("### 📰 Recent Headlines")
 for _, row in df.head(10).iterrows():
     emoji = "🟢" if row["label"] == "positive" else "🔴" if row["label"] == "negative" else "⚪"
-    st.write(f"{emoji} {row['title']}")
+    # Converts the title into a clickable markdown hyperlink
+    st.markdown(f"{emoji} [{row['title']}]({row['link']})")
